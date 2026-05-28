@@ -228,9 +228,12 @@ def log_shap(model, X_train, feature_names: list, day_ahead: int):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def run():
-    # Explicitly authenticate with token for CI environments
-    os.environ["DAGSHUB_USER_TOKEN"] = DAGSHUB_TOKEN
-    dagshub.init(repo_owner=DAGSHUB_USER, repo_name=DAGSHUB_REPO, mlflow=True)
+    # Set up MLflow directly using token — bypasses dagshub.init OAuth flow
+    mlflow.set_tracking_uri(
+        f"https://dagshub.com/{DAGSHUB_USER}/{DAGSHUB_REPO}.mlflow"
+    )
+    os.environ["MLFLOW_TRACKING_USERNAME"] = DAGSHUB_USER
+    os.environ["MLFLOW_TRACKING_PASSWORD"] = DAGSHUB_TOKEN
     mlflow.set_experiment("aqi_predictor")
 
     print(f"Loading data from MongoDB for {CITY}...")
