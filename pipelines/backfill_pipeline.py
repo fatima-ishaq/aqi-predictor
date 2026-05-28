@@ -45,17 +45,25 @@ def fetch_historical(lat, lon, past_days=90):
 def parse_to_dataframe(raw):
     aq = raw["air_quality"]["hourly"]
     wx = raw["weather"]["hourly"]
-    df = pd.DataFrame({
-        "timestamp":            aq["time"],
-        "pm2_5":                aq["pm2_5"],
-        "pm10":                 aq["pm10"],
-        "nitrogen_dioxide":     aq["nitrogen_dioxide"],
-        "ozone":                aq["ozone"],
-        "temperature_2m":       wx["temperature_2m"],
-        "relative_humidity_2m": wx["relative_humidity_2m"],
-        "wind_speed_10m":       wx["wind_speed_10m"],
-        "precipitation":        wx["precipitation"],
+
+    df_aq = pd.DataFrame({
+        "timestamp":        aq["time"],
+        "pm2_5":            aq["pm2_5"],
+        "pm10":             aq["pm10"],
+        "nitrogen_dioxide": aq["nitrogen_dioxide"],
+        "ozone":            aq["ozone"],
     })
+
+    df_wx = pd.DataFrame({
+        "timestamp":              wx["time"],
+        "temperature_2m":         wx["temperature_2m"],
+        "relative_humidity_2m":   wx["relative_humidity_2m"],
+        "wind_speed_10m":         wx["wind_speed_10m"],
+        "precipitation":          wx["precipitation"],
+    })
+
+    # Merge on timestamp so mismatched lengths don't crash
+    df = pd.merge(df_aq, df_wx, on="timestamp", how="inner")
     return df.dropna(subset=["pm2_5"])
 
 
