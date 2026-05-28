@@ -8,6 +8,7 @@ Logs to DagsHub (MLflow). Saves best model per horizon.
 
 import os
 import mlflow
+import tempfile
 import dagshub
 import numpy as np
 import pandas as pd
@@ -99,7 +100,7 @@ def log_shap(model, X_train, feature_names, day_ahead):
 
         plt.figure()
         shap.summary_plot(shap_values, X_train[:200], feature_names=feature_names, show=False)
-        path = f"/tmp/shap_day{day_ahead}.png"
+        path = os.path.join(tempfile.gettempdir(), f"shap_day{day_ahead}.png") 
         plt.savefig(path, bbox_inches="tight")
         plt.close()
         mlflow.log_artifact(path)
