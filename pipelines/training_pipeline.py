@@ -3,6 +3,7 @@ Training Pipeline
 -----------------
 Runs daily via GitHub Actions.
 Trains 3 separate models: Day+1, Day+2, Day+3 AQI prediction.
+Candidates: Random Forest, Gradient Boosting, XGBoost, Keras (deep learning).
 Logs to DagsHub (MLflow). Saves best model to MongoDB GridFS + local pkl.
 """
 
@@ -17,13 +18,14 @@ import shap
 import pickle
 import json
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend, required for CI runners
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,6 +47,79 @@ FEATURE_COLS = [
 ]
 
 
+# ── Keras wrapper ──────────────────────────────────────────────────────────────
+# Wrapped in a sklearn-compatible class so it fits into the same
+# candidates loop without any special-casing.
+
+class KerasRegressorWrapper:
+    """
+    Thin sklearn-compatible wrapper around a Keras dense network.
+    Scales inputs internally so the model sees normalised features.
+    """
+
+    def __init__(self, input_dim: int, epochs: int = 50, batch_size: int = 32):
+        self.input_dim  = input_dim
+        self.epochs     = epochs
+        self.batch_size = batch_size
+        self.scaler     = StandardScaler()
+        self.model      = None
+
+    def _build(self):
+        # Import here so TF is only loaded when this class is used
+        from tensorflow import keras
+        m = keras.Sequential([
+            keras.layers.Dense(64, activation="relu", input_shape=(self.input_dim,)),
+            keras.layers.Dropout(0.2),
+            keras.layers.Dense(32, activation="relu"),
+            keras.layers.Dropout(0.1),
+            keras.layers.Dense(1),
+        ])
+        m.compile(optimizer="adam", loss="mse")
+        return m
+
+    def fit(self, X, y):
+        X_scaled   = self.scaler.fit_transform(X)
+        self.model = self._build()
+        self.model.fit(
+            X_scaled, y,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            validation_split=0.1,
+            verbose=0,                 # silent — logs go to MLflow instead
+        )
+        return self
+
+    def predict(self, X):
+        X_scaled = self.scaler.transform(X)
+        return self.model.predict(X_scaled, verbose=0).flatten()
+
+    # Needed so pickle works correctly for GridFS storage
+    def __getstate__(self):
+        import tempfile, os
+        state = self.__dict__.copy()
+        if self.model is not None:
+            tmp = tempfile.NamedTemporaryFile(suffix=".keras", delete=False)
+            tmp.close()
+            self.model.save(tmp.name)
+            with open(tmp.name, "rb") as f:
+                state["_model_bytes"] = f.read()
+            os.unlink(tmp.name)
+        state["model"] = None
+        return state
+
+    def __setstate__(self, state):
+        import tempfile, os
+        model_bytes = state.pop("_model_bytes", None)
+        self.__dict__.update(state)
+        if model_bytes:
+            from tensorflow import keras
+            tmp = tempfile.NamedTemporaryFile(suffix=".keras", delete=False)
+            tmp.write(model_bytes)
+            tmp.close()
+            self.model = keras.models.load_model(tmp.name)
+            os.unlink(tmp.name)
+
+
 # ── Data loading ───────────────────────────────────────────────────────────────
 
 def load_from_mongodb() -> pd.DataFrame:
@@ -57,18 +132,13 @@ def load_from_mongodb() -> pd.DataFrame:
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-# ── Model saving (GridFS) ──────────────────────────────────────────────────────
+# ── Model persistence ──────────────────────────────────────────────────────────
 
 def save_model_to_mongodb(model, day_ahead: int):
-    """Persist model bytes to MongoDB GridFS so Streamlit Cloud can load them."""
     client = MongoClient(MONGO_URI)
-    db     = client["aqi_db"]
-    fs     = gridfs.GridFS(db, collection="models")
-
-    # Remove previous version for this day
+    fs     = gridfs.GridFS(client["aqi_db"], collection="models")
     for old in fs.find({"filename": f"model_day_{day_ahead}"}):
         fs.delete(old._id)
-
     fs.put(pickle.dumps(model), filename=f"model_day_{day_ahead}", city=CITY)
     client.close()
     print(f"  Saved model_day_{day_ahead} to MongoDB GridFS")
@@ -90,71 +160,67 @@ def train_model_for_day(df: pd.DataFrame, day_ahead: int):
     candidates = {
         "random_forest": RandomForestRegressor(
             n_estimators=200, max_depth=15,
-            min_samples_leaf=5, random_state=42, n_jobs=-1
+            min_samples_leaf=5, random_state=42, n_jobs=-1,
         ),
         "gradient_boosting": GradientBoostingRegressor(
-            n_estimators=200, max_depth=4, random_state=42
+            n_estimators=200, max_depth=4, random_state=42,
         ),
         "xgboost": XGBRegressor(
             n_estimators=200, max_depth=6,
             learning_rate=0.05, random_state=42,
-            verbosity=0, n_jobs=-1
+            verbosity=0, n_jobs=-1,
+        ),
+        "keras_dense": KerasRegressorWrapper(
+            input_dim=len(FEATURE_COLS), epochs=50, batch_size=32,
         ),
     }
 
     best_model, best_rmse, best_name = None, float("inf"), ""
+    all_metrics = {}
 
     print(f"\n  {'Model':<25} {'Train RMSE':>10} {'Test RMSE':>10} {'MAE':>8} {'R²':>7} {'Gap':>8}")
-    print(f"  {'-'*70}")
+    print(f"  {'-'*75}")
 
     for name, model in candidates.items():
         model.fit(X_train, y_train)
 
-        train_preds = model.predict(X_train)
-        test_preds  = model.predict(X_test)
-
-        train_rmse = np.sqrt(mean_squared_error(y_train, train_preds))
-        rmse       = np.sqrt(mean_squared_error(y_test,  test_preds))
-        mae        = mean_absolute_error(y_test, test_preds)
-        r2         = r2_score(y_test, test_preds)
+        train_rmse = float(np.sqrt(mean_squared_error(y_train, model.predict(X_train))))
+        test_preds = model.predict(X_test)
+        rmse       = float(np.sqrt(mean_squared_error(y_test, test_preds)))
+        mae        = float(mean_absolute_error(y_test, test_preds))
+        r2         = float(r2_score(y_test, test_preds))
         gap        = rmse - train_rmse
 
         print(f"  {name:<25} {train_rmse:>10.2f} {rmse:>10.2f} {mae:>8.2f} {r2:>7.3f} {gap:>8.2f}")
+        all_metrics[name] = {"rmse": rmse, "mae": mae, "r2": r2, "train_rmse": train_rmse}
 
         if rmse < best_rmse:
             best_rmse, best_model, best_name = rmse, model, name
 
     print(f"\n  Winner for Day+{day_ahead}: {best_name} (RMSE={best_rmse:.2f})")
-    return best_model, best_name, X_train, X_test, y_train, y_test
+    return best_model, best_name, all_metrics, X_train, X_test, y_train, y_test
 
 
 # ── SHAP ───────────────────────────────────────────────────────────────────────
 
 def log_shap(model, X_train, feature_names: list, day_ahead: int):
+    # SHAP TreeExplainer only works on tree-based models
+    if not hasattr(model, "feature_importances_"):
+        print(f"  SHAP skipped for Day+{day_ahead}: not a tree-based model")
+        return
     try:
-        if hasattr(model, "feature_importances_"):
-            explainer  = shap.TreeExplainer(model)
-            shap_vals  = explainer.shap_values(X_train[:200])
-            plot_X     = X_train[:200]
-        else:
-            explainer  = shap.KernelExplainer(model.predict, shap.sample(X_train, 50))
-            shap_vals  = explainer.shap_values(X_train[:50])
-            plot_X     = X_train[:50]
+        explainer = shap.TreeExplainer(model)
+        shap_vals = explainer.shap_values(X_train[:200])
 
-        fig, ax = plt.subplots()
-        shap.summary_plot(shap_vals, plot_X, feature_names=feature_names, show=False)
-
-        # NamedTemporaryFile works on both Windows and Linux CI runners
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=f"_shap_day{day_ahead}.png", delete=False
-        )
+        fig, _ = plt.subplots()
+        shap.summary_plot(shap_vals, X_train[:200], feature_names=feature_names, show=False)
+        tmp = tempfile.NamedTemporaryFile(suffix=f"_shap_day{day_ahead}.png", delete=False)
         tmp.close()
         plt.savefig(tmp.name, bbox_inches="tight")
         plt.close(fig)
         mlflow.log_artifact(tmp.name)
         os.unlink(tmp.name)
         print(f"  SHAP plot logged for Day+{day_ahead}")
-
     except Exception as e:
         print(f"  SHAP skipped for Day+{day_ahead}: {e}")
 
@@ -177,7 +243,7 @@ def run():
         print(f"Training model for Day+{day_ahead}...")
 
         with mlflow.start_run(run_name=f"day_{day_ahead}"):
-            model, model_name, X_train, X_test, y_train, y_test = \
+            model, model_name, all_metrics, X_train, X_test, y_train, y_test = \
                 train_model_for_day(df, day_ahead)
 
             preds = model.predict(X_test)
@@ -185,36 +251,38 @@ def run():
             mae   = float(mean_absolute_error(y_test, preds))
             r2    = float(r2_score(y_test, preds))
 
-            # Log to DagsHub / MLflow
+            # Log all model scores as params for easy DagsHub comparison
             mlflow.log_params({
-                "model_type": model_name,
-                "day_ahead":  day_ahead,
-                "city":       CITY,
-                "n_features": len(FEATURE_COLS),
+                "model_type":  model_name,
+                "day_ahead":   day_ahead,
+                "city":        CITY,
+                "n_features":  len(FEATURE_COLS),
+                "n_train_rows": len(X_train),
+                # Individual model RMSEs so you can see competition in DagsHub
+                **{f"rmse_{k}": round(v["rmse"], 2) for k, v in all_metrics.items()},
             })
             mlflow.log_metrics({"rmse": rmse, "mae": mae, "r2": r2})
             mlflow.sklearn.log_model(
                 model,
                 name=f"model_day_{day_ahead}",
-                input_example=X_train[:1],   # silences the signature warning
+                input_example=X_train[:1],
             )
 
-            # SHAP
             log_shap(model, X_train, FEATURE_COLS, day_ahead)
 
-            # Save locally (for local Streamlit runs)
-            local_path = f"models/model_day_{day_ahead}.pkl"
-            with open(local_path, "wb") as f:
+            # Save locally
+            with open(f"models/model_day_{day_ahead}.pkl", "wb") as f:
                 pickle.dump(model, f)
 
-            # Save to MongoDB GridFS (for Streamlit Cloud / CI)
+            # Save to GridFS for Streamlit Cloud
             save_model_to_mongodb(model, day_ahead)
 
             metrics_summary[f"day_{day_ahead}"] = {
-                "rmse": round(rmse, 2),
-                "mae":  round(mae,  2),
-                "r2":   round(r2,   3),
+                "rmse":       round(rmse, 2),
+                "mae":        round(mae,  2),
+                "r2":         round(r2,   3),
                 "best_model": model_name,
+                "all_models": {k: round(v["rmse"], 2) for k, v in all_metrics.items()},
             }
 
     with open("models/metrics.json", "w") as f:
