@@ -228,6 +228,8 @@ def log_shap(model, X_train, feature_names: list, day_ahead: int):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def run():
+    # Explicitly authenticate with token for CI environments
+    os.environ["DAGSHUB_USER_TOKEN"] = DAGSHUB_TOKEN
     dagshub.init(repo_owner=DAGSHUB_USER, repo_name=DAGSHUB_REPO, mlflow=True)
     mlflow.set_experiment("aqi_predictor")
 
