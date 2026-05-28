@@ -4,7 +4,7 @@ numpy
 scikit-learn
 xgboost
 tensorflow
-pymongo
+pymongo[srv]
 mlflow
 dagshub
 streamlit
