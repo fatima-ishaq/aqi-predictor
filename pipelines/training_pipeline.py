@@ -73,15 +73,20 @@ def train_model_for_day(df: pd.DataFrame, day_ahead: int):
     best_model, best_rmse, best_name = None, float("inf"), ""
 
     for name, model in candidates.items():
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        rmse  = np.sqrt(mean_squared_error(y_test, preds))
-        mae   = mean_absolute_error(y_test, preds)
-        r2    = r2_score(y_test, preds)
-        print(f"  Day+{day_ahead} | {name:25s} RMSE={rmse:.2f} MAE={mae:.2f} R²={r2:.3f}")
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+    rmse  = np.sqrt(mean_squared_error(y_test, preds))
+    mae   = mean_absolute_error(y_test, preds)
+    r2    = r2_score(y_test, preds)
+    print(f"  Day+{day_ahead} | {name:25s} RMSE={rmse:.2f} MAE={mae:.2f} R²={r2:.3f}")
+    
+    # overfit check
+    train_preds = model.predict(X_train)
+    train_rmse = np.sqrt(mean_squared_error(y_train, train_preds))
+    print(f"           Train RMSE={train_rmse:.2f} | Test RMSE={rmse:.2f} | Gap={rmse-train_rmse:.2f}")
 
-        if rmse < best_rmse:
-            best_rmse, best_model, best_name = rmse, model, name
+    if rmse < best_rmse:
+        best_rmse, best_model, best_name = rmse, model, name
 
     return best_model, best_name, X_train, X_test, y_train, y_test
 
@@ -149,6 +154,7 @@ def run():
         json.dump(metrics_summary, f, indent=2)
 
     print("\nTraining complete. Metrics:", metrics_summary)
+    
 
 
 if __name__ == "__main__":
