@@ -1,0 +1,31 @@
+name: Training Pipeline (Daily)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # every day at 2am UTC
+  workflow_dispatch:
+
+jobs:
+  run-training-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run training pipeline
+        env:
+          MONGODB_URI:       ${{ secrets.MONGODB_URI }}
+          DAGSHUB_TOKEN:     ${{ secrets.DAGSHUB_TOKEN }}
+          DAGSHUB_USERNAME:  ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_REPO_NAME: ${{ secrets.DAGSHUB_REPO_NAME }}
+          CITY_NAME:         ${{ secrets.CITY_NAME }}
+          CITY_LAT:          ${{ secrets.CITY_LAT }}
+          CITY_LON:          ${{ secrets.CITY_LON }}
+        run: python pipelines/training_pipeline.py

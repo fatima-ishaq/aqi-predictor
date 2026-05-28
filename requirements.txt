@@ -1,0 +1,16 @@
+requests
+pandas
+numpy
+scikit-learn
+xgboost
+tensorflow
+pymongo
+mlflow
+dagshub
+streamlit
+plotly
+shap
+python-dotenv
+openmeteo-requests
+requests-cache
+retry-requests
