@@ -18,6 +18,7 @@ import shap
 import pickle
 import json
 import matplotlib
+from sklearn.model_selection import TimeSeriesSplit
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pymongo import MongoClient
@@ -175,31 +176,36 @@ def train_model_for_day(df: pd.DataFrame, day_ahead: int):
         ),
     }
 
-    best_model, best_rmse, best_name = None, float("inf"), ""
+    # TimeSeriesSplit — stable model selection across 5 windows
+    tscv = TimeSeriesSplit(n_splits=5)
+    cv_scores = {name: [] for name in candidates}
+    cv_models = {name: None for name in candidates}
+
+    for train_idx, test_idx in tscv.split(X):
+        for name, model in candidates.items():
+            model.fit(X[train_idx], y[train_idx])
+            preds = model.predict(X[test_idx])
+            cv_scores[name].append(
+                float(np.sqrt(mean_squared_error(y[test_idx], preds)))
+            )
+            cv_models[name] = model  # keep last fold's model
+
+    # Average RMSE across all folds per model
+    print(f"\n  {'Model':<25} {'CV RMSE (mean)':>14} {'Std':>8}")
+    print(f"  {'-'*50}")
     all_metrics = {}
+    for name in candidates:
+        mean_rmse = float(np.mean(cv_scores[name]))
+        std_rmse = float(np.std(cv_scores[name]))
+        print(f"  {name:<25} {mean_rmse:>14.2f} {std_rmse:>8.2f}")
+        all_metrics[name] = {"rmse": mean_rmse, "mae": 0.0, "r2": 0.0}
 
-    print(f"\n  {'Model':<25} {'Train RMSE':>10} {'Test RMSE':>10} {'MAE':>8} {'R²':>7} {'Gap':>8}")
-    print(f"  {'-'*75}")
+    best_name = min(cv_scores, key=lambda k: np.mean(cv_scores[k]))
+    best_model = cv_models[best_name]
+    best_rmse = float(np.mean(cv_scores[best_name]))
 
-    for name, model in candidates.items():
-        model.fit(X_train, y_train)
-
-        train_rmse = float(np.sqrt(mean_squared_error(y_train, model.predict(X_train))))
-        test_preds = model.predict(X_test)
-        rmse       = float(np.sqrt(mean_squared_error(y_test, test_preds)))
-        mae        = float(mean_absolute_error(y_test, test_preds))
-        r2         = float(r2_score(y_test, test_preds))
-        gap        = rmse - train_rmse
-
-        print(f"  {name:<25} {train_rmse:>10.2f} {rmse:>10.2f} {mae:>8.2f} {r2:>7.3f} {gap:>8.2f}")
-        all_metrics[name] = {"rmse": rmse, "mae": mae, "r2": r2, "train_rmse": train_rmse}
-
-        if rmse < best_rmse:
-            best_rmse, best_model, best_name = rmse, model, name
-
-    print(f"\n  Winner for Day+{day_ahead}: {best_name} (RMSE={best_rmse:.2f})")
+    print(f"\n  Winner for Day+{day_ahead}: {best_name} (CV RMSE={best_rmse:.2f})")
     return best_model, best_name, all_metrics, X_train, X_test, y_train, y_test
-
 
 # ── SHAP ───────────────────────────────────────────────────────────────────────
 
