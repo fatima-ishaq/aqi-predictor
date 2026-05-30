@@ -4,13 +4,13 @@ Training Pipeline
 Runs daily via GitHub Actions.
 Trains 3 separate models: Day+1, Day+2, Day+3 AQI prediction.
 Candidates: Random Forest, Gradient Boosting, XGBoost, Keras (deep learning).
+Uses TimeSeriesSplit CV for stable model selection and metric logging.
 Logs to DagsHub (MLflow). Saves best model to MongoDB GridFS + local pkl.
 """
 
 import os
 import mlflow
 import tempfile
-import dagshub
 import gridfs
 import numpy as np
 import pandas as pd
@@ -18,14 +18,13 @@ import shap
 import pickle
 import json
 import matplotlib
-from sklearn.model_selection import TimeSeriesSplit
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 import sys
@@ -49,15 +48,8 @@ FEATURE_COLS = [
 
 
 # ── Keras wrapper ──────────────────────────────────────────────────────────────
-# Wrapped in a sklearn-compatible class so it fits into the same
-# candidates loop without any special-casing.
 
 class KerasRegressorWrapper:
-    """
-    Thin sklearn-compatible wrapper around a Keras dense network.
-    Scales inputs internally so the model sees normalised features.
-    """
-
     def __init__(self, input_dim: int, epochs: int = 50, batch_size: int = 32):
         self.input_dim  = input_dim
         self.epochs     = epochs
@@ -66,7 +58,6 @@ class KerasRegressorWrapper:
         self.model      = None
 
     def _build(self):
-        # Import here so TF is only loaded when this class is used
         from tensorflow import keras
         m = keras.Sequential([
             keras.layers.Dense(64, activation="relu", input_shape=(self.input_dim,)),
@@ -81,22 +72,16 @@ class KerasRegressorWrapper:
     def fit(self, X, y):
         X_scaled   = self.scaler.fit_transform(X)
         self.model = self._build()
-        self.model.fit(
-            X_scaled, y,
-            epochs=self.epochs,
-            batch_size=self.batch_size,
-            validation_split=0.1,
-            verbose=0,                 # silent — logs go to MLflow instead
-        )
+        self.model.fit(X_scaled, y, epochs=self.epochs,
+                       batch_size=self.batch_size,
+                       validation_split=0.1, verbose=0)
         return self
 
     def predict(self, X):
         X_scaled = self.scaler.transform(X)
         return self.model.predict(X_scaled, verbose=0).flatten()
 
-    # Needed so pickle works correctly for GridFS storage
     def __getstate__(self):
-        import tempfile, os
         state = self.__dict__.copy()
         if self.model is not None:
             tmp = tempfile.NamedTemporaryFile(suffix=".keras", delete=False)
@@ -109,7 +94,6 @@ class KerasRegressorWrapper:
         return state
 
     def __setstate__(self, state):
-        import tempfile, os
         model_bytes = state.pop("_model_bytes", None)
         self.__dict__.update(state)
         if model_bytes:
@@ -154,6 +138,7 @@ def train_model_for_day(df: pd.DataFrame, day_ahead: int):
     X = sub[FEATURE_COLS].values
     y = sub[target_col].values
 
+    # Keep a final holdout for SHAP (not used for model selection)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, shuffle=False
     )
@@ -177,50 +162,62 @@ def train_model_for_day(df: pd.DataFrame, day_ahead: int):
     }
 
     # TimeSeriesSplit — stable model selection across 5 windows
-    tscv = TimeSeriesSplit(n_splits=5)
-    cv_scores = {name: [] for name in candidates}
+    tscv      = TimeSeriesSplit(n_splits=5)
+    cv_rmse   = {name: [] for name in candidates}
+    cv_mae    = {name: [] for name in candidates}
+    cv_r2     = {name: [] for name in candidates}
     cv_models = {name: None for name in candidates}
 
-    for train_idx, test_idx in tscv.split(X):
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
         for name, model in candidates.items():
             model.fit(X[train_idx], y[train_idx])
             preds = model.predict(X[test_idx])
-            cv_scores[name].append(
-                float(np.sqrt(mean_squared_error(y[test_idx], preds)))
-            )
-            cv_models[name] = model  # keep last fold's model
+            cv_rmse[name].append(float(np.sqrt(mean_squared_error(y[test_idx], preds))))
+            cv_mae[name].append(float(mean_absolute_error(y[test_idx], preds)))
+            cv_r2[name].append(float(r2_score(y[test_idx], preds)))
+            cv_models[name] = model  # keep last fold's fitted model
 
-    # Average RMSE across all folds per model
-    print(f"\n  {'Model':<25} {'CV RMSE (mean)':>14} {'Std':>8}")
-    print(f"  {'-'*50}")
+    # Aggregate CV metrics
     all_metrics = {}
+    print(f"\n  {'Model':<25} {'CV RMSE':>10} {'±Std':>8} {'CV MAE':>8} {'CV R²':>8}")
+    print(f"  {'-'*65}")
     for name in candidates:
-        mean_rmse = float(np.mean(cv_scores[name]))
-        std_rmse = float(np.std(cv_scores[name]))
-        print(f"  {name:<25} {mean_rmse:>14.2f} {std_rmse:>8.2f}")
-        all_metrics[name] = {"rmse": mean_rmse, "mae": 0.0, "r2": 0.0}
+        mean_rmse = float(np.mean(cv_rmse[name]))
+        std_rmse  = float(np.std(cv_rmse[name]))
+        mean_mae  = float(np.mean(cv_mae[name]))
+        mean_r2   = float(np.mean(cv_r2[name]))
+        print(f"  {name:<25} {mean_rmse:>10.2f} {std_rmse:>8.2f} {mean_mae:>8.2f} {mean_r2:>8.3f}")
+        all_metrics[name] = {
+            "rmse": mean_rmse,
+            "mae":  mean_mae,
+            "r2":   mean_r2,
+            "std":  std_rmse,
+        }
 
-    best_name = min(cv_scores, key=lambda k: np.mean(cv_scores[k]))
+    # Winner = lowest average CV RMSE
+    best_name  = min(cv_rmse, key=lambda k: np.mean(cv_rmse[k]))
     best_model = cv_models[best_name]
-    best_rmse = float(np.mean(cv_scores[best_name]))
+    print(f"\n  Winner for Day+{day_ahead}: {best_name} "
+          f"(CV RMSE={all_metrics[best_name]['rmse']:.2f} "
+          f"± {all_metrics[best_name]['std']:.2f})")
 
-    print(f"\n  Winner for Day+{day_ahead}: {best_name} (CV RMSE={best_rmse:.2f})")
     return best_model, best_name, all_metrics, X_train, X_test, y_train, y_test
+
 
 # ── SHAP ───────────────────────────────────────────────────────────────────────
 
 def log_shap(model, X_train, feature_names: list, day_ahead: int):
-    # SHAP TreeExplainer only works on tree-based models
     if not hasattr(model, "feature_importances_"):
         print(f"  SHAP skipped for Day+{day_ahead}: not a tree-based model")
         return
     try:
         explainer = shap.TreeExplainer(model)
         shap_vals = explainer.shap_values(X_train[:200])
-
-        fig, _ = plt.subplots()
-        shap.summary_plot(shap_vals, X_train[:200], feature_names=feature_names, show=False)
-        tmp = tempfile.NamedTemporaryFile(suffix=f"_shap_day{day_ahead}.png", delete=False)
+        fig, _    = plt.subplots()
+        shap.summary_plot(shap_vals, X_train[:200],
+                          feature_names=feature_names, show=False)
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=f"_shap_day{day_ahead}.png", delete=False)
         tmp.close()
         plt.savefig(tmp.name, bbox_inches="tight")
         plt.close(fig)
@@ -234,7 +231,7 @@ def log_shap(model, X_train, feature_names: list, day_ahead: int):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def run():
-    # Set up MLflow directly using token — bypasses dagshub.init OAuth flow
+    # Direct MLflow auth — no dagshub.init OAuth needed in CI
     mlflow.set_tracking_uri(
         f"https://dagshub.com/{DAGSHUB_USER}/{DAGSHUB_REPO}.mlflow"
     )
@@ -257,22 +254,28 @@ def run():
             model, model_name, all_metrics, X_train, X_test, y_train, y_test = \
                 train_model_for_day(df, day_ahead)
 
-            preds = model.predict(X_test)
-            rmse  = float(np.sqrt(mean_squared_error(y_test, preds)))
-            mae   = float(mean_absolute_error(y_test, preds))
-            r2    = float(r2_score(y_test, preds))
+            # Use CV metrics for logging — stable across runs
+            rmse = round(all_metrics[model_name]["rmse"], 2)
+            mae  = round(all_metrics[model_name]["mae"],  2)
+            r2   = round(all_metrics[model_name]["r2"],   3)
+            std  = round(all_metrics[model_name]["std"],  2)
 
-            # Log all model scores as params for easy DagsHub comparison
             mlflow.log_params({
-                "model_type":  model_name,
-                "day_ahead":   day_ahead,
-                "city":        CITY,
-                "n_features":  len(FEATURE_COLS),
-                "n_train_rows": len(X_train),
-                # Individual model RMSEs so you can see competition in DagsHub
-                **{f"rmse_{k}": round(v["rmse"], 2) for k, v in all_metrics.items()},
+                "model_type":   model_name,
+                "day_ahead":    day_ahead,
+                "city":         CITY,
+                "n_features":   len(FEATURE_COLS),
+                "n_rows":       len(df),
+                "cv_folds":     5,
+                **{f"cv_rmse_{k}": round(v["rmse"], 2)
+                   for k, v in all_metrics.items()},
             })
-            mlflow.log_metrics({"rmse": rmse, "mae": mae, "r2": r2})
+            mlflow.log_metrics({
+                "cv_rmse": rmse,
+                "cv_mae":  mae,
+                "cv_r2":   r2,
+                "cv_std":  std,
+            })
             mlflow.sklearn.log_model(
                 model,
                 name=f"model_day_{day_ahead}",
@@ -289,11 +292,13 @@ def run():
             save_model_to_mongodb(model, day_ahead)
 
             metrics_summary[f"day_{day_ahead}"] = {
-                "rmse":       round(rmse, 2),
-                "mae":        round(mae,  2),
-                "r2":         round(r2,   3),
+                "rmse":       rmse,
+                "mae":        mae,
+                "r2":         r2,
+                "cv_std":     std,
                 "best_model": model_name,
-                "all_models": {k: round(v["rmse"], 2) for k, v in all_metrics.items()},
+                "all_models": {k: round(v["rmse"], 2)
+                               for k, v in all_metrics.items()},
             }
 
     with open("models/metrics.json", "w") as f:
@@ -302,7 +307,8 @@ def run():
     print(f"\n{'='*60}")
     print("Training complete.")
     for horizon, m in metrics_summary.items():
-        print(f"  {horizon}: {m['best_model']:<25} RMSE={m['rmse']} R²={m['r2']}")
+        print(f"  {horizon}: {m['best_model']:<25} "
+              f"CV RMSE={m['rmse']} ±{m['cv_std']} R²={m['r2']}")
 
 
 if __name__ == "__main__":
