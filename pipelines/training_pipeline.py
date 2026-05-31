@@ -175,7 +175,7 @@ def train_model_for_day(df: pd.DataFrame, day_ahead: int):
             cv_rmse[name].append(float(np.sqrt(mean_squared_error(y[test_idx], preds))))
             cv_mae[name].append(float(mean_absolute_error(y[test_idx], preds)))
             cv_r2[name].append(float(r2_score(y[test_idx], preds)))
-            cv_models[name] = model  # keep last fold's fitted model
+            cv_models[name] = model
 
     # Aggregate CV metrics
     all_metrics = {}
@@ -271,10 +271,10 @@ def run():
                    for k, v in all_metrics.items()},
             })
             mlflow.log_metrics({
-                "cv_rmse": rmse,
-                "cv_mae":  mae,
-                "cv_r2":   r2,
-                "cv_std":  std,
+                "rmse":   rmse,
+                "mae":    mae,
+                "r2":     r2,
+                "cv_std": std,
             })
             mlflow.sklearn.log_model(
                 model,
