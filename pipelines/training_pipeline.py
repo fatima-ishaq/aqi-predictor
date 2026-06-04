@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
+from datetime import datetime  
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 from sklearn.dummy import DummyRegressor
@@ -129,6 +130,18 @@ def save_model_to_mongodb(model, day_ahead: int):
     client.close()
     print(f"  Saved model_day_{day_ahead} to MongoDB GridFS")
 
+# ── for metrics table  ──────────────────────────────────────────────────────────
+
+def save_metrics_to_mongodb(metrics_summary):
+    client = MongoClient(MONGO_URI)
+    db = client["aqi_db"]
+    collection = db["metrics"]
+    collection.update_one(
+        {"city": CITY},
+        {"$set": {"metrics": metrics_summary, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+    client.close()
 
 # ── Training ───────────────────────────────────────────────────────────────────
 
@@ -311,6 +324,8 @@ def run():
 
     with open("models/metrics.json", "w") as f:
         json.dump(metrics_summary, f, indent=2)
+    
+    save_metrics_to_mongodb(metrics_summary)
 
     print(f"\n{'='*60}")
     print("Training complete.")

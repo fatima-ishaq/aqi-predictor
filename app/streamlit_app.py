@@ -89,7 +89,17 @@ def load_recent_features():
 
 @st.cache_data(ttl=86400)
 def load_metrics():
-    # Try local file first (fast), fallback to MongoDB
+    # Try MongoDB first
+    try:
+        client = MongoClient(MONGO_URI)
+        doc = client["aqi_db"]["metrics"].find_one({"city": CITY})
+        client.close()
+        if doc:
+            return doc.get("metrics", {})
+    except:
+        pass
+    
+    # Fallback to local file
     if os.path.exists("models/metrics.json"):
         with open("models/metrics.json") as f:
             return json.load(f)
