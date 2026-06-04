@@ -4,7 +4,6 @@ Training Pipeline
 Runs daily via GitHub Actions.
 Trains 3 separate models: Day+1, Day+2, Day+3 AQI prediction.
 Candidates: Random Forest, Gradient Boosting, XGBoost, Keras (deep learning).
-Uses TimeSeriesSplit CV for stable model selection and metric logging.
 Logs to DagsHub (MLflow). Saves best model to MongoDB GridFS + local pkl.
 """
 
@@ -24,9 +23,10 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
+from sklearn.dummy import DummyRegressor
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -133,16 +133,26 @@ def save_model_to_mongodb(model, day_ahead: int):
 
 def train_model_for_day(df: pd.DataFrame, day_ahead: int):
     target_col = f"target_day_{day_ahead}"
-    sub = df[FEATURE_COLS + [target_col]].dropna()
-
+    
+    # Only drop NaNs for THIS target
+    sub = df[FEATURE_COLS + [target_col] + ["timestamp"]].dropna()
+    
+    # Remove last 48 hours (where targets are NaN for future days)
+    sub = sub.iloc[:-48]
+    
     X = sub[FEATURE_COLS].values
     y = sub[target_col].values
-
-    # Keep a final holdout for SHAP (not used for model selection)
+    
+    # Simple 80/20 split
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, shuffle=False
     )
-
+    
+    print(f"  Train rows: {len(X_train)} | Test rows: {len(X_test)}")
+    print(f"  Train dates: {sub['timestamp'].iloc[0]} to {sub['timestamp'].iloc[len(X_train)-1]}")
+    print(f"  Test dates: {sub['timestamp'].iloc[len(X_train)]} to {sub['timestamp'].iloc[-1]}")
+    
+    # ── Candidates ──────────────────────────────────────────────────────────────
     candidates = {
         "random_forest": RandomForestRegressor(
             n_estimators=200, max_depth=15,
@@ -160,48 +170,41 @@ def train_model_for_day(df: pd.DataFrame, day_ahead: int):
             input_dim=len(FEATURE_COLS), epochs=50, batch_size=32,
         ),
     }
-
-    # TimeSeriesSplit — stable model selection across 5 windows
-    tscv      = TimeSeriesSplit(n_splits=5)
-    cv_rmse   = {name: [] for name in candidates}
-    cv_mae    = {name: [] for name in candidates}
-    cv_r2     = {name: [] for name in candidates}
-    cv_models = {name: None for name in candidates}
-
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
-        for name, model in candidates.items():
-            model.fit(X[train_idx], y[train_idx])
-            preds = model.predict(X[test_idx])
-            cv_rmse[name].append(float(np.sqrt(mean_squared_error(y[test_idx], preds))))
-            cv_mae[name].append(float(mean_absolute_error(y[test_idx], preds)))
-            cv_r2[name].append(float(r2_score(y[test_idx], preds)))
-            cv_models[name] = model
-
-    # Aggregate CV metrics
+    
     all_metrics = {}
-    print(f"\n  {'Model':<25} {'CV RMSE':>10} {'±Std':>8} {'CV MAE':>8} {'CV R²':>8}")
-    print(f"  {'-'*65}")
-    for name in candidates:
-        mean_rmse = float(np.mean(cv_rmse[name]))
-        std_rmse  = float(np.std(cv_rmse[name]))
-        mean_mae  = float(np.mean(cv_mae[name]))
-        mean_r2   = float(np.mean(cv_r2[name]))
-        print(f"  {name:<25} {mean_rmse:>10.2f} {std_rmse:>8.2f} {mean_mae:>8.2f} {mean_r2:>8.3f}")
-        all_metrics[name] = {
-            "rmse": mean_rmse,
-            "mae":  mean_mae,
-            "r2":   mean_r2,
-            "std":  std_rmse,
-        }
-
-    # Winner = lowest average CV RMSE
-    best_name  = min(cv_rmse, key=lambda k: np.mean(cv_rmse[k]))
-    best_model = cv_models[best_name]
-    print(f"\n  Winner for Day+{day_ahead}: {best_name} "
-          f"(CV RMSE={all_metrics[best_name]['rmse']:.2f} "
-          f"± {all_metrics[best_name]['std']:.2f})")
-
+    best_model, best_rmse, best_name = None, float("inf"), ""
+    
+    print(f"\n  {'Model':<25} {'Train RMSE':>10} {'Test RMSE':>10} {'MAE':>8} {'R2':>7} {'Gap':>8}")
+    print(f"  {'-'*70}")
+    
+    for name, model in candidates.items():
+        try:
+            model.fit(X_train, y_train)
+            train_preds = model.predict(X_train)
+            test_preds = model.predict(X_test)
+            train_rmse = float(np.sqrt(mean_squared_error(y_train, train_preds)))
+            rmse = float(np.sqrt(mean_squared_error(y_test, test_preds)))
+            mae = float(mean_absolute_error(y_test, test_preds))
+            r2 = float(r2_score(y_test, test_preds))
+            gap = rmse - train_rmse
+            print(f"  {name:<25} {train_rmse:>10.2f} {rmse:>10.2f} {mae:>8.2f} {r2:>7.3f} {gap:>8.2f}")
+            all_metrics[name] = {"rmse": rmse, "mae": mae, "r2": r2}
+            if rmse < best_rmse:
+                best_rmse, best_model, best_name = rmse, model, name
+        except Exception as e:
+            print(f"  {name:<25} {'ERROR':>10} -> {str(e)[:50]}")
+            all_metrics[name] = {"rmse": float('inf'), "mae": float('inf'), "r2": float('-inf')}
+    
+    if best_model is None:
+        print(f"  WARNING: No model trained successfully for Day+{day_ahead}")
+        best_model = DummyRegressor(strategy="mean")
+        best_model.fit(X_train, y_train)
+        best_name = "dummy"
+        best_rmse = float('inf')
+    
+    print(f"\n  Winner for Day+{day_ahead}: {best_name} (RMSE={best_rmse:.2f})")
     return best_model, best_name, all_metrics, X_train, X_test, y_train, y_test
+
 
 
 # ── SHAP ───────────────────────────────────────────────────────────────────────
@@ -254,27 +257,23 @@ def run():
             model, model_name, all_metrics, X_train, X_test, y_train, y_test = \
                 train_model_for_day(df, day_ahead)
 
-            # Use CV metrics for logging — stable across runs
             rmse = round(all_metrics[model_name]["rmse"], 2)
             mae  = round(all_metrics[model_name]["mae"],  2)
             r2   = round(all_metrics[model_name]["r2"],   3)
-            std  = round(all_metrics[model_name]["std"],  2)
 
             mlflow.log_params({
-                "model_type":   model_name,
-                "day_ahead":    day_ahead,
-                "city":         CITY,
-                "n_features":   len(FEATURE_COLS),
-                "n_rows":       len(df),
-                "cv_folds":     5,
-                **{f"cv_rmse_{k}": round(v["rmse"], 2)
+                "model_type":  model_name,
+                "day_ahead":   day_ahead,
+                "city":        CITY,
+                "n_features":  len(FEATURE_COLS),
+                "n_rows":      len(df),
+                **{f"rmse_{k}": round(v["rmse"], 2)
                    for k, v in all_metrics.items()},
             })
             mlflow.log_metrics({
-                "rmse":   rmse,
-                "mae":    mae,
-                "r2":     r2,
-                "cv_std": std,
+                "rmse": rmse,
+                "mae":  mae,
+                "r2":   r2,
             })
             mlflow.sklearn.log_model(
                 model,
@@ -284,18 +283,15 @@ def run():
 
             log_shap(model, X_train, FEATURE_COLS, day_ahead)
 
-            # Save locally
             with open(f"models/model_day_{day_ahead}.pkl", "wb") as f:
                 pickle.dump(model, f)
 
-            # Save to GridFS for Streamlit Cloud
             save_model_to_mongodb(model, day_ahead)
 
             metrics_summary[f"day_{day_ahead}"] = {
                 "rmse":       rmse,
                 "mae":        mae,
                 "r2":         r2,
-                "cv_std":     std,
                 "best_model": model_name,
                 "all_models": {k: round(v["rmse"], 2)
                                for k, v in all_metrics.items()},
@@ -307,8 +303,7 @@ def run():
     print(f"\n{'='*60}")
     print("Training complete.")
     for horizon, m in metrics_summary.items():
-        print(f"  {horizon}: {m['best_model']:<25} "
-              f"CV RMSE={m['rmse']} ±{m['cv_std']} R²={m['r2']}")
+        print(f"  {horizon}: {m['best_model']:<25} RMSE={m['rmse']} R2={m['r2']}")
 
 
 if __name__ == "__main__":
