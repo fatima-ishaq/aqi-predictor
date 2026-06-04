@@ -27,6 +27,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 from sklearn.dummy import DummyRegressor
+from sklearn.ensemble import VotingRegressor
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -134,6 +135,11 @@ def save_model_to_mongodb(model, day_ahead: int):
 def train_model_for_day(df: pd.DataFrame, day_ahead: int):
     target_col = f"target_day_{day_ahead}"
     
+    # --- ADD THIS: Only use rows with complete weather data ---
+    weather_cols = ['temperature_2m', 'relative_humidity_2m', 'wind_speed_10m', 'precipitation']
+    df = df.dropna(subset=weather_cols).copy()
+    # --- End of addition ---
+    
     # Only drop NaNs for THIS target
     sub = df[FEATURE_COLS + [target_col] + ["timestamp"]].dropna()
     
@@ -152,24 +158,30 @@ def train_model_for_day(df: pd.DataFrame, day_ahead: int):
     print(f"  Train dates: {sub['timestamp'].iloc[0]} to {sub['timestamp'].iloc[len(X_train)-1]}")
     print(f"  Test dates: {sub['timestamp'].iloc[len(X_train)]} to {sub['timestamp'].iloc[-1]}")
     
+  
     # ── Candidates ──────────────────────────────────────────────────────────────
     candidates = {
-        "random_forest": RandomForestRegressor(
-            n_estimators=200, max_depth=15,
-            min_samples_leaf=5, random_state=42, n_jobs=-1,
-        ),
-        "gradient_boosting": GradientBoostingRegressor(
-            n_estimators=200, max_depth=4, random_state=42,
-        ),
-        "xgboost": XGBRegressor(
-            n_estimators=200, max_depth=6,
-            learning_rate=0.05, random_state=42,
-            verbosity=0, n_jobs=-1,
-        ),
-        "keras_dense": KerasRegressorWrapper(
-            input_dim=len(FEATURE_COLS), epochs=50, batch_size=32,
-        ),
-    }
+    "random_forest": RandomForestRegressor(
+        n_estimators=200, max_depth=15,
+        min_samples_leaf=5, random_state=42, n_jobs=-1,
+    ),
+    "gradient_boosting": GradientBoostingRegressor(
+        n_estimators=200, max_depth=4, random_state=42,
+    ),
+    "xgboost": XGBRegressor(
+        n_estimators=200, max_depth=6,
+        learning_rate=0.05, random_state=42,
+        verbosity=0, n_jobs=-1,
+    ),
+    "keras_dense": KerasRegressorWrapper(
+        input_dim=len(FEATURE_COLS), epochs=50, batch_size=32,
+    ),
+    "voting_ensemble": VotingRegressor([
+        ("rf", RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)),
+        ("xgb", XGBRegressor(n_estimators=200, max_depth=6, random_state=42)),
+        ("gb", GradientBoostingRegressor(n_estimators=200, max_depth=4, random_state=42)),
+    ]),  # ← Make sure closing parenthesis is here
+}
     
     all_metrics = {}
     best_model, best_rmse, best_name = None, float("inf"), ""
