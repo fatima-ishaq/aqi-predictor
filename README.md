@@ -7,6 +7,7 @@ An automated machine learning system that predicts Air Quality Index (AQI) 1, 2,
 This system combines real-time weather and air quality data from Open-Meteo with feature engineering and multiple ML models to forecast AQI levels. The entire pipeline is automated via GitHub Actions, with results visualized on an interactive Streamlit dashboard.
 
 **Deployed Application:** https://aqi-predictor-yxfvfm2vxstp8ugcuiphzn.streamlit.app/
+**View Experiments on DagsHub:**https://dagshub.com/fatima-ishaq/aqi-predictor/experiments
 
 ## Features
 
