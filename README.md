@@ -97,16 +97,6 @@ python pipelines/training_pipeline.py
 streamlit run app/streamlit_app.py
 ```
 
-## Model Performance
-
-| Horizon | Best Model | RMSE | R² |
-|---------|-----------|------|-----|
-| **Day+1** | Random Forest | ~16-20 | -1.5 to -0.2 |
-| **Day+2** | Gradient Boosting / XGBoost | ~7-20 | -2.4 to 0.55 |
-| **Day+3** | Gradient Boosting | ~10-24 | -2.6 to 0.40 |
-
-*Note: Metrics vary based on test set period (normal vs spike weeks). R² positive indicates good performance.*
-
 ## Deployment
 
 - **GitHub Actions** schedules feature pipeline (hourly) and training pipeline (daily)
