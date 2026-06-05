@@ -9,6 +9,11 @@ This system combines real-time weather and air quality data from Open-Meteo with
 **Deployed Application:** https://aqi-predictor-yxfvfm2vxstp8ugcuiphzn.streamlit.app/
 **View Experiments on DagsHub:**https://dagshub.com/fatima-ishaq/aqi-predictor/experiments
 
+Key metrics tracked per run:
+- RMSE, MAE, R² for each model and horizon
+- Model parameters
+- SHAP explainability plots
+
 ## Features
 
 - **Multi-day forecasting**: Predicts AQI for 24h, 48h, and 72h ahead
