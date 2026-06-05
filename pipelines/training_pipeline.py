@@ -192,8 +192,7 @@ def train_model_for_day(df: pd.DataFrame, day_ahead: int):
         ("rf", RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)),
         ("xgb", XGBRegressor(n_estimators=200, max_depth=6, random_state=42)),
         ("gb", GradientBoostingRegressor(n_estimators=200, max_depth=4, random_state=42)),
-    ]),  # ← Make sure closing parenthesis is here
-}
+    ]),  }
     
     all_metrics = {}
     best_model, best_rmse, best_name = None, float("inf"), ""
