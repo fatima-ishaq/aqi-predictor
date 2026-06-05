@@ -2,8 +2,7 @@
 Training Pipeline
 -----------------
 Runs daily via GitHub Actions.
-Trains 3 separate models: Day+1, Day+2, Day+3 AQI prediction.
-Candidates: Random Forest, Gradient Boosting, XGBoost, Keras (deep learning).
+Trains separate models: Day+1, Day+2, Day+3 AQI prediction.
 Logs to DagsHub (MLflow). Saves best model to MongoDB GridFS + local pkl.
 """
 
